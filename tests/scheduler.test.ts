@@ -18,6 +18,7 @@ interface Rig {
 function makeRig(options: {
   tracks?: { length: number; enabled: number[]; pitch?: number; gate?: number; channel?: number }[];
   tempo?: number;
+  lookaheadMs?: number;
 }): Rig {
   const tempo = options.tempo ?? BPM;
   const pattern: Pattern = { tracks: [] };
@@ -43,6 +44,7 @@ function makeRig(options: {
     clock,
     getPattern: () => pattern,
     getTempo: () => tempo,
+    lookaheadMs: options.lookaheadMs,
     onStep: (s) => steps.push(s)
   });
   scheduler.setOutput(out);
@@ -326,5 +328,242 @@ describe('Scheduler output handling', () => {
     for (let i = 1; i < ons.length; i++) {
       expect(offs[i - 1]!.timeMs!).toBeLessThanOrEqual(ons[i]!.timeMs!);
     }
+  });
+});
+
+describe('Scheduler live score editing', () => {
+  it('disabling a queued step cancels its note before it can fire', () => {
+    const rig = makeRig({ tracks: [{ length: 4, enabled: [1] }] });
+    rig.scheduler.play();
+    rig.clock.advance(25); // step 1 (due 126) is now queued in the lookahead
+    expect(
+      rig.scheduler.queuedEvents.some((e) => e.kind === 'noteOn' && e.step === 1)
+    ).toBe(true);
+    rig.pattern.tracks[0]!.steps[1]!.enabled = false;
+    rig.scheduler.stepEdited(rig.pattern.tracks[0]!.id, 1);
+    expect(
+      rig.scheduler.queuedEvents.some((e) => e.kind === 'noteOn' && e.step === 1)
+    ).toBe(false);
+    rig.clock.advance(500);
+    expect(noteOns(rig.out).length).toBe(0); // the stale queued note never fired
+  });
+
+  it('enabling a step inside the lookahead window still fires it on time', () => {
+    const rig = makeRig({ tracks: [{ length: 4, enabled: [] }] });
+    rig.scheduler.play();
+    rig.clock.advance(25);
+    rig.pattern.tracks[0]!.steps[1]!.enabled = true;
+    rig.pattern.tracks[0]!.steps[1]!.pitch = 55;
+    rig.scheduler.stepEdited(rig.pattern.tracks[0]!.id, 1);
+    rig.clock.advance(200);
+    const ons = noteOns(rig.out);
+    expect(ons.length).toBe(1);
+    expect(ons[0]!.message[1]).toBe(55);
+    expect(ons[0]!.timeMs).toBe(1 + STEP_MS); // original boundary, not edit time
+  });
+
+  it('disabling a sounding step releases its note immediately and only once', () => {
+    const rig = makeRig({ tracks: [{ length: 4, enabled: [0], gate: 1.0 }] });
+    rig.scheduler.play();
+    rig.clock.advance(100); // step 0 sounding; its off was due at 126
+    rig.pattern.tracks[0]!.steps[0]!.enabled = false;
+    rig.scheduler.stepEdited(rig.pattern.tracks[0]!.id, 0);
+    const offs = noteOffs(rig.out);
+    expect(offs.length).toBe(1); // released at edit time (100), not at the old 126
+    expect(offs[0]!.timeMs).toBe(100);
+    rig.clock.advance(10); // past where the stale off would have fired
+    expect(noteOffs(rig.out).length).toBe(1); // never closed twice
+    expect(noteOns(rig.out).length).toBe(1); // not retriggered by the loop
+  });
+
+  it('changing pitch releases the old sounding note without a stray new-pitch off', () => {
+    const rig = makeRig({ tracks: [{ length: 4, enabled: [0], gate: 1.0 }] });
+    rig.scheduler.play();
+    rig.clock.advance(100);
+    rig.pattern.tracks[0]!.steps[0]!.pitch = 72;
+    rig.scheduler.stepEdited(rig.pattern.tracks[0]!.id, 0);
+    expect(noteOffs(rig.out).map((m) => m.message[1])).toEqual([60]);
+    rig.clock.advance(450);
+    // Only the old pitch ever gets an off; the new pitch plays next loop.
+    expect(noteOffs(rig.out).map((m) => m.message[1])).toEqual([60]);
+    expect(noteOns(rig.out).map((m) => m.message[1])).toContain(72);
+  });
+
+  it('updates pitch and velocity of a queued-but-unsent note in place', () => {
+    const rig = makeRig({ tracks: [{ length: 4, enabled: [1], gate: 0.5 }] });
+    rig.scheduler.play();
+    rig.clock.advance(25); // step 1 queued
+    rig.pattern.tracks[0]!.steps[1]!.pitch = 80;
+    rig.pattern.tracks[0]!.steps[1]!.velocity = 42;
+    rig.scheduler.stepEdited(rig.pattern.tracks[0]!.id, 1);
+    rig.clock.advance(200);
+    const ons = noteOns(rig.out);
+    expect(ons.length).toBe(1);
+    expect(ons[0]!.message).toEqual([0x90, 80, 42]);
+    expect(ons[0]!.timeMs).toBe(1 + STEP_MS); // still on the same boundary
+  });
+
+  it('shortening the gate of a sounding note releases it earlier', () => {
+    const rig = makeRig({ tracks: [{ length: 4, enabled: [0], gate: 1.0 }] });
+    rig.scheduler.play();
+    rig.clock.advance(100); // off originally due at 126
+    rig.pattern.tracks[0]!.steps[0]!.gate = 0.2; // new off time 26, already past
+    rig.scheduler.stepEdited(rig.pattern.tracks[0]!.id, 0);
+    const offs = noteOffs(rig.out);
+    expect(offs.length).toBe(1); // released at edit time, not at the old 126
+    expect(offs[0]!.timeMs).toBe(100);
+    rig.clock.advance(20); // the stale queued off (126) must not fire again
+    expect(noteOffs(rig.out).length).toBe(1);
+    expect(noteOns(rig.out).length).toBe(1);
+  });
+
+  it('lengthening the gate postpones the note-off without overlapping or sticking', () => {
+    const rig = makeRig({ tracks: [{ length: 1, enabled: [0], gate: 0.25 }] });
+    rig.scheduler.play();
+    rig.clock.advance(100);
+    rig.pattern.tracks[0]!.steps[0]!.gate = 1;
+    rig.scheduler.stepEdited(rig.pattern.tracks[0]!.id, 0);
+    rig.clock.advance(300);
+    rig.scheduler.stop();
+    const ons = noteOns(rig.out);
+    // No duplicate ons, and every on is matched by exactly one off.
+    expect(ons.length).toBe(new Set(ons.map((m) => m.timeMs)).size);
+    expect(noteOffs(rig.out).length).toBe(ons.length);
+  });
+
+  it('shortening a track cancels voices from cells it no longer owns', () => {
+    const rig = makeRig({
+      tracks: [{ length: 8, enabled: [0, 3], gate: 1.0 }],
+      lookaheadMs: 500
+    });
+    rig.scheduler.play();
+    rig.clock.advance(100); // cell 0 sounding; cell 3 (due 376) queued
+    expect(
+      rig.scheduler.queuedEvents.some(
+        (e) => e.kind === 'noteOn' && e.trackId === rig.pattern.tracks[0]!.id && e.step === 3
+      )
+    ).toBe(true);
+    rig.pattern.tracks[0]!.steps.length = 2; // cells 2..7 are gone
+    rig.scheduler.trackEdited(rig.pattern.tracks[0]!.id);
+    // The cell-0 sounding note survives (step 8 % 2 === 0 still owns it);
+    // the queued cell-3 note is dropped and never fires.
+    expect(noteOffs(rig.out).length).toBe(0);
+    rig.clock.advance(500);
+    expect(
+      noteOns(rig.out).some((m) => m.timeMs === 1 + 3 * STEP_MS)
+    ).toBe(false);
+  });
+
+  it('muting a track silences its notes and queue without moving other tracks', () => {
+    const rig = makeRig({
+      tracks: [
+        { length: 4, enabled: [0, 2], gate: 1.0, pitch: 60, channel: 0 },
+        { length: 4, enabled: [1], gate: 1.0, pitch: 64, channel: 1 }
+      ]
+    });
+    rig.scheduler.play();
+    rig.clock.advance(100); // track 0 cell 0 sounding; tracks' future cells queued
+    rig.pattern.tracks[0]!.muted = true;
+    rig.scheduler.trackEdited(rig.pattern.tracks[0]!.id);
+    expect(noteOffs(rig.out).map((m) => m.message)).toEqual([[0x80, 60, 0]]);
+    rig.clock.advance(400);
+    // Muted track stays silent (its initial on is the only one)…
+    expect(noteOns(rig.out).map((m) => m.message[1])).toEqual([60, 64]);
+    // …and the other track fired exactly on its original boundary.
+    expect(noteOns(rig.out)[1]!.timeMs).toBe(1 + STEP_MS);
+  });
+
+  it('editing one track never moves the other track off the global grid', () => {
+    const rig = makeRig({
+      tracks: [
+        { length: 4, enabled: [0], pitch: 60, channel: 0 },
+        { length: 4, enabled: [0, 1, 2, 3], pitch: 64, channel: 1, gate: 0.2 }
+      ]
+    });
+    rig.scheduler.play();
+    rig.clock.advance(50);
+    // A burst of edits on track 0 must not rewind or shift the timeline.
+    rig.pattern.tracks[0]!.steps[0]!.pitch = 70;
+    rig.scheduler.stepEdited(rig.pattern.tracks[0]!.id, 0);
+    rig.pattern.tracks[0]!.muted = true;
+    rig.scheduler.trackEdited(rig.pattern.tracks[0]!.id);
+    rig.pattern.tracks[0]!.steps.length = 2;
+    rig.scheduler.trackEdited(rig.pattern.tracks[0]!.id);
+    rig.clock.advance(450);
+    const track1Ons = noteOns(rig.out).filter((m) => (m.message[0]! & 0x0f) === 1);
+    expect(track1Ons.map((m) => m.timeMs)).toEqual([
+      1,
+      1 + STEP_MS,
+      1 + 2 * STEP_MS,
+      1 + 3 * STEP_MS
+    ]);
+  });
+});
+
+describe('Scheduler shared channel and pitch', () => {
+  it('releasing one overlapping voice never sends note-off while another holds the key', () => {
+    // Both tracks share channel 0 / pitch 60, starting together at t=1:
+    // track 1's short note ends at 63.5, track 0's long one runs to 126.
+    // Long tracks (length 16) keep this inside a single loop.
+    const rig = makeRig({
+      tracks: [
+        { length: 16, enabled: [0], gate: 1.0, pitch: 60, channel: 0 },
+        { length: 16, enabled: [0], gate: 0.5, pitch: 60, channel: 0 }
+      ]
+    });
+    rig.scheduler.play();
+    rig.clock.advance(100); // both note-ons out; track 1 already released internally
+    expect(noteOns(rig.out).length).toBe(2);
+    expect(noteOffs(rig.out).length).toBe(0); // key still held by track 0
+    rig.clock.advance(55); // next tick past 126 dispatches track 0's own off
+    expect(noteOffs(rig.out).length).toBe(1); // exactly one wire note-off
+    rig.scheduler.stop();
+    expect(noteOffs(rig.out).length).toBe(1); // nothing stuck, nothing doubled
+  });
+
+  it('muting one track of a shared key never ends the other track early', () => {
+    const rig = makeRig({
+      tracks: [
+        { length: 16, enabled: [0], gate: 1.0, pitch: 60, channel: 0 },
+        { length: 16, enabled: [0], gate: 1.0, pitch: 60, channel: 0 }
+      ]
+    });
+    rig.scheduler.play();
+    rig.clock.advance(100); // both voices sounding on the same wire key
+    rig.pattern.tracks[0]!.muted = true;
+    rig.scheduler.trackEdited(rig.pattern.tracks[0]!.id);
+    expect(noteOffs(rig.out).length).toBe(0); // track 1 still needs the note
+    rig.clock.advance(20); // well before track 1's natural off at 126
+    expect(noteOffs(rig.out).length).toBe(0); // still held by the sibling
+    rig.clock.advance(35); // next tick past 126: track 1's off is the first
+    expect(noteOffs(rig.out).length).toBe(1);
+    rig.scheduler.stop();
+    expect(noteOffs(rig.out).length).toBe(1); // nothing stuck, nothing doubled
+  });
+
+  it('a retrigger / tempo replan in one track never clamps a sibling note-off', () => {
+    const rig = makeRig({
+      tracks: [
+        { length: 8, enabled: [0, 1, 2, 3], gate: 1.0, pitch: 60, channel: 0 },
+        { length: 8, enabled: [0], gate: 1.0, pitch: 60, channel: 0 }
+      ]
+    });
+    let tempo = BPM;
+    const scheduler = new Scheduler({
+      clock: rig.clock,
+      getPattern: () => rig.pattern,
+      getTempo: () => tempo
+    });
+    scheduler.setOutput(rig.out);
+    scheduler.play();
+    rig.clock.advance(100); // both step-0 notes sounding; offs due at 126
+    tempo = 240;
+    scheduler.tempoChanged(); // re-plans track 0's steps 1+ on a new grid
+    rig.clock.advance(400);
+    // Track 1's note-off (126) must not be dragged onto track 0's replanned
+    // trigger (110): the first wire note-off cannot arrive before 126.
+    const offs = noteOffs(rig.out);
+    expect(offs.length).toBeGreaterThan(0);
+    expect(offs[0]!.timeMs).toBeGreaterThanOrEqual(1 + STEP_MS);
   });
 });

@@ -146,6 +146,10 @@ export class SequencerController {
       }
       return p;
     });
+    // A toggle must take effect immediately: cancel a note already queued
+    // for a turned-off step, or make a turned-on step fire if it is due
+    // inside the current lookahead window.
+    this.scheduler.stepEdited(trackId, index);
   }
 
   updateStep(trackId: string, index: number, patch: Partial<Omit<Step, 'enabled'>>): void {
@@ -160,6 +164,9 @@ export class SequencerController {
       }
       return p;
     });
+    // Apply pitch / velocity / gate changes to queued and sounding notes,
+    // not only to steps scheduled after the edit.
+    this.scheduler.stepEdited(trackId, index);
   }
 
   selectStep(trackId: string, index: number): void {
@@ -167,12 +174,17 @@ export class SequencerController {
   }
 
   addTrack(): void {
+    let added: string | null = null;
     this.pattern.update((p) => {
       if (p.tracks.length >= MAX_TRACKS) return p;
       const length = p.tracks[0]?.steps.length ?? 16;
-      p.tracks.push(createTrack(length));
+      const track = createTrack(length);
+      added = track.id;
+      p.tracks.push(track);
       return p;
     });
+    // Let the new track join the pattern immediately if it owns a due cell.
+    if (added) this.scheduler.trackEdited(added);
   }
 
   removeTrack(trackId: string): void {
@@ -183,6 +195,8 @@ export class SequencerController {
       if (sel && sel.trackId === trackId) this.selection.set(null);
       return p;
     });
+    // Cancel everything the removed track had queued or sounding.
+    this.scheduler.trackEdited(trackId, true);
   }
 
   setTrackLength(trackId: string, length: number): void {
@@ -191,6 +205,9 @@ export class SequencerController {
       if (track) resizeTrack(track, length);
       return p;
     });
+    // Voices from cells the shortened track no longer owns must be
+    // cancelled at once; surviving cells keep their scheduled voices.
+    this.scheduler.trackEdited(trackId);
   }
 
   setTrackChannel(trackId: string, channel: number): void {
@@ -199,6 +216,8 @@ export class SequencerController {
       if (track) track.channel = clampInt(channel, 0, 15);
       return p;
     });
+    // Release notes on the old channel; due steps go out on the new one.
+    this.scheduler.trackEdited(trackId);
   }
 
   toggleMute(trackId: string): void {
@@ -207,6 +226,9 @@ export class SequencerController {
       if (track) track.muted = !track.muted;
       return p;
     });
+    // Muting drops that track's queue and silences its notes; unmuting
+    // lets due steps rejoin without restarting or moving the timeline.
+    this.scheduler.trackEdited(trackId);
   }
 
   // --- device events ---

@@ -17,9 +17,24 @@
  * part of the queue at the new tempo while leaving already-sounding notes
  * (and their note-offs) untouched.
  *
+ * Live score edits (`stepEdited` / `trackEdited`) never rewind the clock:
+ * they reconcile only the queued and sounding voices produced by the edited
+ * cell or track. Turning a step off, muting or shortening a track cancels
+ * its queued note-ons and releases its sounding notes immediately; pitch /
+ * channel changes release the old note (the new one sounds next pass);
+ * velocity and gate edits update the pending pair (a shortened gate on a
+ * sounding note releases it early, a lengthened one postpones the off).
+ * Because reconciliation is scoped by track and global step, editing one
+ * track cannot move another track's beat.
+ *
+ * Voices are tracked independently even when two tracks share a MIDI
+ * channel and pitch: the wire key state is a set of voice ids, so a wire
+ * note-off is sent only when the *last* overlapping voice closes. Closing
+ * one track's note can therefore never end another track's sound early.
+ *
  * Pause, stop, output switch and output loss all run the same cleanup:
  * cancel every queued (unsent) message and immediately note-off every
- * note this scheduler started, so nothing can stick or fire twice.
+ * wire key this scheduler started, so nothing can stick or fire twice.
  */
 
 import type { Clock, TimerHandle } from './clock';
@@ -39,6 +54,9 @@ export interface ScheduledEvent {
   velocity: number;
   /** Links a note-off to the note-on it belongs to. */
   pairId: number;
+  /** Track and global step this event was materialized from (live-edit scope). */
+  trackId: string;
+  step: number;
 }
 
 interface ActiveNote {
@@ -46,6 +64,12 @@ interface ActiveNote {
   pitch: number;
   /** True once the note-on was actually dispatched (audibly sounding). */
   sounding: boolean;
+  /** Identity of the score cell that produced this voice. */
+  trackId: string;
+  step: number;
+  /** Note-on time and the step duration in force when it was scheduled. */
+  onTime: number;
+  stepDur: number;
 }
 
 export interface SchedulerOptions {
@@ -93,6 +117,17 @@ export class Scheduler {
   private stepTimes: { step: number; time: number }[] = [];
   /** Notes this scheduler started and has not yet closed, keyed by note-on event id. */
   private activeNotes = new Map<number, ActiveNote>();
+  /**
+   * Voices currently holding each wire key, keyed by (channel, pitch).
+   *
+   * On a MIDI cable a note number is either held or not: a second note-on
+   * while the key is held restarts the voice rather than adding a second
+   * held key, and the note-off only becomes valid once the *last* voice
+   * stops. Tracking the voice ids per key lets two tracks share a channel
+   * and pitch — releasing one voice can never end the other's sound early,
+   * while MIDI pairing (one on / one off) is still preserved.
+   */
+  private heldKeys = new Map<number, Set<number>>();
   private eventSeq = 0;
 
   constructor(options: SchedulerOptions) {
@@ -200,6 +235,36 @@ export class Scheduler {
     this.rewindToLastBoundary();
   }
 
+  /**
+   * Reconcile one step cell after a live edit (enable toggle, pitch /
+   * velocity / gate change). Only voices produced by that cell are
+   * touched, so other tracks — and the global timeline — never move:
+   *
+   * - queued note-ons are dropped when the cell no longer fires, or
+   *   updated to the new pitch / velocity / gate;
+   * - a note that is already sounding is closed at once when disabled,
+   *   and when its pitch or channel changes the old pitch is released;
+   * - a shortened gate releases the sounding note earlier; a lengthened
+   *   gate postpones the note-off (never past the step boundary — the
+   *   same-track retrigger guard clamps it at the next trigger).
+   */
+  stepEdited(trackId: string, index: number): void {
+    if (this.state !== 'playing') return;
+    this.reconcileTrack(trackId, { cellIndex: index });
+  }
+
+  /**
+   * Reconcile one track after a live structural edit (mute toggle, length
+   * change, channel change, removal). Voices the track no longer owns are
+   * cancelled or released immediately; voices that merely moved channel
+   * are released on the old channel. Other tracks' queued events, voices
+   * and step boundaries are left exactly where they were.
+   */
+  trackEdited(trackId: string, removed = false): void {
+    if (this.state !== 'playing') return;
+    this.reconcileTrack(trackId, { removed });
+  }
+
   /** Duration of one step in ms at the current tempo. */
   stepDuration(): number {
     return 60000 / (this.getTempo() * STEPS_PER_BEAT);
@@ -252,50 +317,70 @@ export class Scheduler {
   private scheduleStep(step: number, time: number, stepDur: number): void {
     const pattern = this.getPattern();
     for (const track of pattern.tracks) {
-      if (track.muted || track.steps.length === 0) continue;
-      const cell = track.steps[step % track.steps.length];
-      if (!cell || !cell.enabled) continue;
-
-      // Retrigger guard: any still-open instance of the same note (whether
-      // already sounding or merely queued) is closed exactly when the new
-      // one starts, so the two never overlap or stick.
-      for (const e of this.pending) {
-        if (
-          e.kind === 'noteOff' &&
-          e.channel === track.channel &&
-          e.pitch === cell.pitch &&
-          e.time > time
-        ) {
-          e.time = time;
-        }
-      }
-
-      const onId = ++this.eventSeq;
-      const offId = ++this.eventSeq;
-      this.pending.push({
-        id: onId,
-        kind: 'noteOn',
-        time,
-        channel: track.channel,
-        pitch: cell.pitch,
-        velocity: cell.velocity,
-        pairId: offId
-      });
-      this.pending.push({
-        id: offId,
-        kind: 'noteOff',
-        time: time + stepDur * cell.gate,
-        channel: track.channel,
-        pitch: cell.pitch,
-        velocity: 0,
-        pairId: onId
-      });
-      this.activeNotes.set(onId, {
-        channel: track.channel,
-        pitch: cell.pitch,
-        sounding: false
-      });
+      this.scheduleTrackStep(track, step, time, stepDur);
     }
+  }
+
+  private scheduleTrackStep(
+    track: Pattern['tracks'][number],
+    step: number,
+    time: number,
+    stepDur: number
+  ): void {
+    if (track.muted || track.steps.length === 0) return;
+    const cell = track.steps[step % track.steps.length];
+    if (!cell || !cell.enabled) return;
+
+    // Retrigger guard: any still-open instance of the same note *on the
+    // same track* (whether already sounding or merely queued) is closed
+    // exactly when the new one starts, so the two never overlap or stick.
+    // The match is scoped by track: another track sharing this channel
+    // and pitch is a separate voice and must keep ringing.
+    for (const e of this.pending) {
+      if (
+        e.kind === 'noteOff' &&
+        e.trackId === track.id &&
+        e.channel === track.channel &&
+        e.pitch === cell.pitch &&
+        e.time > time
+      ) {
+        e.time = time;
+      }
+    }
+
+    const onId = ++this.eventSeq;
+    const offId = ++this.eventSeq;
+    this.pending.push({
+      id: onId,
+      kind: 'noteOn',
+      time,
+      channel: track.channel,
+      pitch: cell.pitch,
+      velocity: cell.velocity,
+      pairId: offId,
+      trackId: track.id,
+      step
+    });
+    this.pending.push({
+      id: offId,
+      kind: 'noteOff',
+      time: time + stepDur * cell.gate,
+      channel: track.channel,
+      pitch: cell.pitch,
+      velocity: 0,
+      pairId: onId,
+      trackId: track.id,
+      step
+    });
+    this.activeNotes.set(onId, {
+      channel: track.channel,
+      pitch: cell.pitch,
+      sounding: false,
+      trackId: track.id,
+      step,
+      onTime: time,
+      stepDur
+    });
   }
 
   private dispatchDue(now: number): void {
@@ -305,18 +390,24 @@ export class Scheduler {
         .sort((a, b) => a.time - b.time || a.id - b.id);
       this.pending = this.pending.filter((e) => e.time > now);
       for (const event of due) {
-        if (this.output) {
-          this.output.send(
-            event.kind === 'noteOn'
-              ? noteOn(event.channel, event.pitch, event.velocity)
-              : noteOff(event.channel, event.pitch),
-            event.time
-          );
-        }
         if (event.kind === 'noteOn') {
+          if (this.output) {
+            this.output.send(
+              noteOn(event.channel, event.pitch, event.velocity),
+              event.time
+            );
+          }
+          this.acquireKey(event.channel, event.pitch, event.id);
           const active = this.activeNotes.get(event.id);
           if (active) active.sounding = true;
         } else {
+          this.releaseKey(
+            event.channel,
+            event.pitch,
+            event.pairId,
+            this.output,
+            event.time
+          );
           this.activeNotes.delete(event.pairId);
         }
       }
@@ -331,12 +422,21 @@ export class Scheduler {
     }
   }
 
-  /** Send note-offs for every sounding note to the given output. */
+  /**
+   * Send note-offs for every sounding voice to the given output. Each
+   * distinct held (channel, pitch) is closed exactly once: when several
+   * tracks overlap on the same key the wire still carries a single
+   * note-off, and no earlier release can have closed a sibling voice.
+   */
   private silence(output: MidiOutputAdapter | null): void {
-    if (!output) return;
-    for (const note of this.activeNotes.values()) {
-      if (note.sounding) output.send(noteOff(note.channel, note.pitch));
+    if (!output) {
+      this.heldKeys.clear();
+      return;
     }
+    for (const key of this.heldKeys.keys()) {
+      output.send(noteOff((key >> 8) & 0x0f, key & 0xff));
+    }
+    this.heldKeys.clear();
   }
 
   /** Drop every queued-but-unsent message and forget all open notes. */
@@ -344,6 +444,7 @@ export class Scheduler {
     this.pending = [];
     this.stepTimes = [];
     this.activeNotes.clear();
+    this.heldKeys.clear();
   }
 
   /**
@@ -359,6 +460,184 @@ export class Scheduler {
     );
     for (const id of unsentOnIds) this.activeNotes.delete(id);
     this.stepTimes = [];
+  }
+
+  // --- live score editing ------------------------------------------------
+  //
+  // Edits never rewind the clock or touch other tracks: they reconcile
+  // only the queued/sounding voices produced by the edited cell, reading
+  // the fresh pattern at edit time. Voices are identified by (trackId,
+  // global step), which stays valid across track resizing: a cell the
+  // shortened track no longer owns is recognized as stale and dropped.
+
+  private reconcileTrack(
+    trackId: string,
+    scope: { cellIndex?: number; removed?: boolean }
+  ): void {
+    const now = this.clock.now();
+    const track = this.getPattern().tracks.find((t) => t.id === trackId) ?? null;
+    const removed = scope.removed ?? false;
+    const muted = removed || (track?.muted ?? true);
+    const length = track?.steps.length ?? 0;
+
+    // A voice belongs to this reconciliation when it came from this track
+    // and (for a cell edit) the edited cell is the one that produced it.
+    // Identity is global-step based: after a resize the global step of an
+    // old voice is looked up in the *current* array, so voices the
+    // shortened track no longer owns are recognized as stale.
+    const inScope = (originStep: number): boolean =>
+      scope.cellIndex === undefined ||
+      (!muted && length > 0 && originStep % length === scope.cellIndex);
+
+    // --- queued, not-yet-dispatched events ---
+    for (const e of [...this.pending]) {
+      if (e.trackId !== trackId || !inScope(e.step)) continue;
+
+      if (muted || removed || length === 0) {
+        // Whole track silenced / removed: drop every queued event.
+        this.pending.splice(this.pending.indexOf(e), 1);
+        if (e.kind === 'noteOn') this.activeNotes.delete(e.id);
+        continue;
+      }
+      const cell = track!.steps[e.step % length]!;
+      if (!cell.enabled || e.channel !== track!.channel || e.pitch !== cell.pitch) {
+        // Cell turned off, or moved channel/pitch: the pair is stale.
+        this.pending.splice(this.pending.indexOf(e), 1);
+        if (e.kind === 'noteOn') this.activeNotes.delete(e.id);
+        continue;
+      }
+      if (e.kind === 'noteOn') {
+        e.velocity = cell.velocity;
+      } else {
+        // Keep the original on-time and planned step duration; only the
+        // gate fraction changed.
+        const source = this.activeNotes.get(e.pairId);
+        if (source) e.time = source.onTime + source.stepDur * cell.gate;
+      }
+    }
+
+    // --- sounding notes (and queued note-ons whose pair was dropped) ---
+    for (const [id, note] of [...this.activeNotes]) {
+      if (note.trackId !== trackId || !inScope(note.step)) continue;
+
+      const cell =
+        !muted && !removed && length > 0 ? track!.steps[note.step % length] : undefined;
+      const sameDestination =
+        !!cell &&
+        cell.enabled &&
+        note.channel === track!.channel &&
+        note.pitch === cell.pitch;
+
+      if (!sameDestination) {
+        // Silenced, moved to another pitch/channel, or the cell went away:
+        // release the sounding wire note immediately (refcount-shared keys
+        // keep sibling voices alive). Never-sent voices are just forgotten.
+        this.cancelVoice(id, note, now);
+        continue;
+      }
+      if (!note.sounding) {
+        // Keep the record when its queued pair survived (e.g. a velocity
+        // or gate edit); only drop it for re-materialization below when
+        // the note-on itself was discarded.
+        const onStillQueued = this.pending.some(
+          (e) => e.kind === 'noteOn' && e.id === id
+        );
+        if (!onStillQueued) this.activeNotes.delete(id);
+        continue;
+      }
+      // Same pitch, still sounding: only a changed gate is audible.
+      const newOff = note.onTime + note.stepDur * cell.gate;
+      const off = this.pending.find((e) => e.kind === 'noteOff' && e.pairId === id);
+      if (newOff <= now) {
+        // Gate shortened into the past: drop the stale queued off and
+        // close the sounding note at once.
+        if (off) this.pending.splice(this.pending.indexOf(off), 1);
+        this.cancelVoice(id, note, now);
+      } else if (off) {
+        off.time = newOff; // the retrigger guard clamps it at the next trigger
+      }
+    }
+
+    // --- re-materialize planned steps the edit made valid again ---
+    // Steps already inside the lookahead window are only visited by ticks
+    // on the *next* loop; without this, a quick enable / channel change /
+    // unmute would skip a due note. Other tracks and the timeline are
+    // untouched — we only plan this track's voices on existing boundaries.
+    if (!muted && !removed && track) {
+      const stepDur = Math.max(1, this.stepDuration());
+      for (const s of this.stepTimes) {
+        // Same horizon as a tick: overdue within the catch-up window
+        // (a late timer is still allowed to fire), up to the lookahead edge.
+        if (s.time > now - this.catchUpMs && s.time <= now + this.lookaheadMs) {
+          const cellIndex = s.step % track.steps.length;
+          if (scope.cellIndex === undefined || cellIndex === scope.cellIndex) {
+            const hasVoice =
+              this.pending.some(
+                (e) =>
+                  e.kind === 'noteOn' && e.trackId === trackId && e.step === s.step
+              ) ||
+              [...this.activeNotes.values()].some(
+                (n) => n.trackId === trackId && n.step === s.step
+              );
+            if (!hasVoice) this.scheduleTrackStep(track, s.step, s.time, stepDur);
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Tear down one voice: remove its queued events, release the wire note
+   * if it was sounding, and forget it. Sibling voices on the same
+   * (channel, pitch) — possibly from another track — are untouched.
+   */
+  private cancelVoice(onId: number, note: ActiveNote, now?: number): void {
+    this.pending = this.pending.filter((e) => e.pairId !== onId && e.id !== onId);
+    if (note.sounding) {
+      this.releaseKey(note.channel, note.pitch, onId, this.output, now);
+    }
+    this.activeNotes.delete(onId);
+  }
+
+  private keyOf(channel: number, pitch: number): number {
+    return (channel << 8) | pitch;
+  }
+
+  /**
+   * Record that a sounding voice holds a wire key. A second overlapping
+   * note-on is still sent (MIDI restarts the voice), but its id joins the
+   * set so the note-off is withheld until every overlapping voice ends.
+   */
+  private acquireKey(channel: number, pitch: number, voiceId: number): void {
+    const key = this.keyOf(channel, pitch);
+    let voices = this.heldKeys.get(key);
+    if (!voices) {
+      voices = new Set<number>();
+      this.heldKeys.set(key, voices);
+    }
+    voices.add(voiceId);
+  }
+
+  /**
+   * Release one voice on a wire key; the wire note-off goes out only when
+   * the last remaining voice releases. Without an output (e.g. the device
+   * already gone) the bookkeeping is still kept correct.
+   */
+  private releaseKey(
+    channel: number,
+    pitch: number,
+    voiceId: number,
+    output: MidiOutputAdapter | null,
+    timeMs?: number
+  ): void {
+    const key = this.keyOf(channel, pitch);
+    const voices = this.heldKeys.get(key);
+    if (!voices) return;
+    voices.delete(voiceId);
+    if (voices.size === 0) {
+      if (output) output.send(noteOff(channel, pitch), timeMs);
+      this.heldKeys.delete(key);
+    }
   }
 
   /** Re-schedule the lookahead window starting at the last reached boundary. */
